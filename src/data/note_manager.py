@@ -13,7 +13,7 @@ from typing import Optional
 
 
 _NOTES_DIR = "data/notes"
-_VALID_TYPES = {"thesis", "observation", "concern", "review", "target", "lesson", "journal"}
+_VALID_TYPES = {"thesis", "observation", "concern", "review", "target", "lesson", "journal", "exit-rule"}
 _VALID_CATEGORIES = {"stock", "portfolio", "market", "general"}
 
 
@@ -32,6 +32,8 @@ def save_note(
     base_dir: str = _NOTES_DIR,
     trigger: Optional[str] = None,
     expected_action: Optional[str] = None,
+    stop_loss: Optional[str] = None,
+    take_profit: Optional[str] = None,
 ) -> dict:
     """Save a note to JSON file and Neo4j.
 
@@ -107,6 +109,13 @@ def save_note(
         if expected_action:
             note["expected_action"] = expected_action
 
+    # KIK-566: exit-rule specific fields
+    if note_type == "exit-rule":
+        if stop_loss:
+            note["stop_loss"] = stop_loss
+        if take_profit:
+            note["take_profit"] = take_profit
+
     # KIK-564: Lesson conflict detection (before save)
     lesson_conflicts: list[dict] = []
     if note_type == "lesson":
@@ -147,7 +156,7 @@ def save_note(
     # 2. Write to Neo4j (view) -- graceful degradation
     try:
         from src.data.graph_store import merge_note
-        from src.data.history_store import _build_embedding
+        from src.data.history import _build_embedding
         sem_summary, emb = _build_embedding(
             "note", symbol=symbol or "", note_type=note_type, content=content,
             trigger=note.get("trigger", ""),
@@ -183,7 +192,7 @@ def save_note(
 
     # KIK-434: AI graph linking (graceful degradation)
     try:
-        from src.data.graph_linker import link_note
+        from src.data.graph_store.linker import link_note
         if detected_symbols:
             for ds in detected_symbols:
                 link_note(note_id, ds, note_type, content)
@@ -191,6 +200,16 @@ def save_note(
             link_note(note_id, symbol, note_type, content)
     except Exception:
         pass
+
+    # KIK-571: Lesson community classification
+    if note_type == "lesson":
+        try:
+            from src.data.lesson_community import classify_lesson, merge_lesson_community
+            community = classify_lesson(content, trigger or "")
+            merge_lesson_community(note_id, community)
+            note["_lesson_community"] = community
+        except Exception:
+            pass  # graceful degradation
 
     # KIK-564: Attach conflicts to return value
     if lesson_conflicts:
@@ -259,112 +278,109 @@ def check_lesson_conflicts(
     base_dir: str = _NOTES_DIR,
     similarity_threshold: float = 0.5,
 ) -> list[dict]:
-    """Check if a new lesson conflicts with existing lessons (KIK-564).
+    """Check if a new lesson conflicts with existing lessons (KIK-564/570).
 
-    Detects conflicts by:
-    1. Similar trigger with different expected_action (keyword overlap)
-    2. TEI embedding cosine similarity above threshold
-
-    Parameters
-    ----------
-    new_lesson : dict
-        The new lesson being saved. Must have 'trigger' and/or 'expected_action'.
-    base_dir : str
-        Notes directory.
-    similarity_threshold : float
-        Minimum similarity to flag as potential conflict (0-1).
-
-    Returns
-    -------
-    list[dict]
-        Each dict: {existing_lesson, similarity, conflict_type}
-        Empty list if no conflicts found.
+    Delegates to lesson_conflict.find_conflicts() for unified detection.
     """
     existing = load_notes(note_type="lesson", base_dir=base_dir)
     if not existing:
         return []
-
-    new_trigger = (new_lesson.get("trigger") or "").strip()
-    new_action = (new_lesson.get("expected_action") or "").strip()
-    new_content = (new_lesson.get("content") or "").strip()
-    new_text = f"{new_trigger} {new_action} {new_content}".strip()
-
-    if not new_text:
+    try:
+        from src.data.lesson_conflict import find_conflicts
+        return find_conflicts(new_lesson, existing, similarity_threshold)
+    except ImportError:
         return []
 
-    conflicts = []
-    for ex in existing:
-        # Skip self (same id)
-        if ex.get("id") == new_lesson.get("id"):
-            continue
 
-        ex_trigger = (ex.get("trigger") or "").strip()
-        ex_action = (ex.get("expected_action") or "").strip()
-        ex_content = (ex.get("content") or "").strip()
-        ex_text = f"{ex_trigger} {ex_action} {ex_content}".strip()
-
-        if not ex_text:
-            continue
-
-        # Method 1: Trigger-focused similarity (KIK-564)
-        trigger_sim = _keyword_similarity(new_trigger, ex_trigger) if new_trigger and ex_trigger else 0.0
-        text_sim = _keyword_similarity(new_text, ex_text)
-        # Weight trigger similarity higher (60% trigger, 40% full text)
-        sim = trigger_sim * 0.6 + text_sim * 0.4 if trigger_sim > 0 else text_sim
-
-        # Method 2: TEI embedding similarity (if available and keyword sim is moderate)
-        if 0.2 < sim < similarity_threshold:
-            emb_sim = _embedding_similarity(new_text, ex_text)
-            if emb_sim is not None:
-                sim = max(sim, emb_sim)
-
-        if sim < similarity_threshold:
-            continue
-
-        # Determine conflict type
-        conflict_type = "similar"
-        if trigger_sim > 0.3 and new_action != ex_action and new_action and ex_action:
-            conflict_type = "contradicting_action"
-
-        conflicts.append({
-            "existing_lesson": ex,
-            "similarity": round(sim, 3),
-            "conflict_type": conflict_type,
-        })
-
-    conflicts.sort(key=lambda c: c["similarity"], reverse=True)
-    return conflicts[:5]
-
-
+# Backward-compatible aliases (used by auto_context and tests)
 def _keyword_similarity(text_a: str, text_b: str) -> float:
-    """Compute Jaccard similarity on word sets (fast, no deps)."""
-    words_a = set(text_a.lower().split())
-    words_b = set(text_b.lower().split())
-    if not words_a or not words_b:
-        return 0.0
-    intersection = words_a & words_b
-    union = words_a | words_b
-    return len(intersection) / len(union) if union else 0.0
+    """CJK-aware keyword similarity (KIK-570 delegates to lesson_conflict)."""
+    try:
+        from src.data.lesson_conflict import keyword_similarity
+        return keyword_similarity(text_a, text_b)
+    except ImportError:
+        # Fallback: space-split only
+        words_a = set(text_a.lower().split())
+        words_b = set(text_b.lower().split())
+        if not words_a or not words_b:
+            return 0.0
+        return len(words_a & words_b) / len(words_a | words_b)
 
 
 def _embedding_similarity(text_a: str, text_b: str) -> Optional[float]:
-    """Compute cosine similarity via TEI embeddings. Returns None if unavailable."""
+    """Cosine similarity via TEI (KIK-570 delegates to lesson_conflict)."""
     try:
-        from src.data import embedding_client
-        if not embedding_client.is_available():
-            return None
-        emb_a = embedding_client.get_embedding(text_a)
-        emb_b = embedding_client.get_embedding(text_b)
-        if emb_a is None or emb_b is None:
-            return None
-        # Cosine similarity
-        dot = sum(a * b for a, b in zip(emb_a, emb_b))
-        norm_a = sum(a * a for a in emb_a) ** 0.5
-        norm_b = sum(b * b for b in emb_b) ** 0.5
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return dot / (norm_a * norm_b)
-    except Exception:
+        from src.data.lesson_conflict import embedding_similarity
+        return embedding_similarity(text_a, text_b)
+    except ImportError:
+        return None
+
+
+def get_exit_rules(
+    symbol: Optional[str] = None,
+    base_dir: str = _NOTES_DIR,
+) -> list[dict]:
+    """Load exit-rule notes, optionally filtered by symbol (KIK-566).
+
+    Returns list of exit-rule notes sorted by date descending.
+    Each note has stop_loss and/or take_profit fields.
+    """
+    return load_notes(note_type="exit-rule", symbol=symbol, base_dir=base_dir)
+
+
+def check_exit_rule(
+    symbol: str,
+    pnl_pct: float,
+    base_dir: str = _NOTES_DIR,
+) -> Optional[dict]:
+    """Check if a position has hit any exit-rule threshold (KIK-566).
+
+    Parameters
+    ----------
+    symbol : str
+        Ticker symbol.
+    pnl_pct : float
+        Current P&L percentage (e.g., -15.0 means -15%).
+
+    Returns
+    -------
+    Optional[dict]
+        {type: "stop_loss"|"take_profit", threshold: str, reason: str}
+        or None if no threshold hit.
+    """
+    rules = get_exit_rules(symbol=symbol, base_dir=base_dir)
+    if not rules:
+        return None
+
+    # Use the most recent rule
+    rule = rules[0]
+    reason = (rule.get("content") or "")[:100]
+
+    # Check stop_loss
+    sl = rule.get("stop_loss", "")
+    if sl:
+        sl_val = _parse_threshold(sl)
+        if sl_val is not None and pnl_pct <= sl_val:
+            return {"type": "stop_loss", "threshold": sl, "reason": reason}
+
+    # Check take_profit
+    tp = rule.get("take_profit", "")
+    if tp:
+        tp_val = _parse_threshold(tp)
+        if tp_val is not None and pnl_pct >= tp_val:
+            return {"type": "take_profit", "threshold": tp, "reason": reason}
+
+    return None
+
+
+def _parse_threshold(value: str) -> Optional[float]:
+    """Parse a threshold string like '-15%' or '+20%' into a float."""
+    if not value:
+        return None
+    s = value.strip().replace("%", "").replace("％", "")
+    try:
+        return float(s)
+    except ValueError:
         return None
 
 
